@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: opus-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    region: singapore
+    branch: main
+    healthCheckPath: /
+    envVars:
+      - key: PORT
+        value: 3000
+      - key: MIN_FREE_MB
+        value: 500
+        
