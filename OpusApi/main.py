@@ -247,6 +247,14 @@ async def api_stats(request: Request):
     })
 
 
+@app.get("/ping")
+async def ping():
+    """Minimal, near-zero-cost endpoint for uptime pingers (e.g. UptimeRobot,
+    cron-job.org) to hit periodically so Render's free tier doesn't spin
+    the service down after 15 minutes of inactivity."""
+    return JSONResponse({"status": "ok"})
+
+
 @app.get("/download")
 async def generate_token(request: Request, url: str, type: str = "audio"):
     video_id   = extract_video_id(url)
@@ -401,4 +409,3 @@ if __name__ == "__main__":
     import uvicorn
     port = find_free_port(DEFAULT_PORT)
     uvicorn.run(app, host="0.0.0.0", port=port)
-    
