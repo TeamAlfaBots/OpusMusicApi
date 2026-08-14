@@ -28,6 +28,65 @@ DEFAULT_PORT = int(os.environ.get("PORT", 8080))
 # the least-recently-used cached files until we're back above it.
 MIN_FREE_BYTES = int(os.environ.get("MIN_FREE_MB", 500)) * 1024 * 1024
 
+# ── Proxy pool ────────────────────────────────────────────────
+# Datacenter IPs (Render, Railway, etc.) get rate-limited by YouTube
+# (HTTP 429). Routing yt-dlp through rotating proxies works around this.
+# Each entry: "host:port:username:password"
+_RAW_PROXIES = [
+    "31.59.20.176:6754:gxlmpfsu:yux6p1iui0os",
+    "31.56.127.193:7684:gxlmpfsu:yux6p1iui0os",
+    "45.38.107.97:6014:gxlmpfsu:yux6p1iui0os",
+    "198.105.121.200:6462:gxlmpfsu:yux6p1iui0os",
+    "64.137.96.74:6641:gxlmpfsu:yux6p1iui0os",
+    "198.23.243.226:6361:gxlmpfsu:yux6p1iui0os",
+    "38.154.185.97:6370:gxlmpfsu:yux6p1iui0os",
+    "84.247.60.125:6095:gxlmpfsu:yux6p1iui0os",
+    "142.111.67.146:5611:gxlmpfsu:yux6p1iui0os",
+    "191.96.254.138:6185:gxlmpfsu:yux6p1iui0os",
+]
+
+
+def _parse_proxy(raw: str) -> str:
+    """Convert 'host:port:user:pass' into a yt-dlp/curl-style proxy URL."""
+    host, port, user, pwd = raw.split(":")
+    return f"http://{user}:{pwd}@{host}:{port}"
+
+
+PROXIES = [_parse_proxy(p) for p in _RAW_PROXIES]
+
+FAIL_THRESHOLD  = 3
+BLOCK_DURATION  = 30 * 60  # 30 minutes
+_proxy_index    = 0
+_fail_count     = {p: 0 for p in PROXIES}
+_blocked_until  = {p: 0.0 for p in PROXIES}
+_proxy_guard    = asyncio.Lock()
+
+
+def _mark_proxy_fail(proxy: str) -> None:
+    _fail_count[proxy] += 1
+    if _fail_count[proxy] >= FAIL_THRESHOLD:
+        _blocked_until[proxy] = time.time() + BLOCK_DURATION
+
+
+def _mark_proxy_success(proxy: str) -> None:
+    _fail_count[proxy] = 0
+    _blocked_until[proxy] = 0.0
+
+
+async def get_proxy_order() -> list[str]:
+    """Return proxies to try, round-robin started, unblocked first."""
+    global _proxy_index
+    async with _proxy_guard:
+        now = time.time()
+        available = [p for p in PROXIES if _blocked_until[p] <= now]
+        if not available:
+            # Everything's blocked — fall back to trying all of them
+            # anyway rather than failing outright.
+            available = list(PROXIES)
+        start = _proxy_index % len(available)
+        _proxy_index += 1
+        return available[start:] + available[:start]
+
 
 def find_free_port(preferred: int) -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -176,12 +235,15 @@ async def api_stats(request: Request):
     cache_size = sum(os.path.getsize(os.path.join(CACHE_DIR, f)) for f in os.listdir(CACHE_DIR) if os.path.isfile(os.path.join(CACHE_DIR, f)))
     cache_mb = round(cache_size / (1024 * 1024), 2)
     free_mb = round(_free_bytes(CACHE_DIR) / (1024 * 1024), 2)
+    now = time.time()
+    healthy_proxies = sum(1 for p in PROXIES if _blocked_until[p] <= now)
     return JSONResponse({
         "status":               "success",
         "total_song_downloads": total_dl,
         "total_cache_size_mb":  cache_mb,
         "free_disk_mb":         free_mb,
         "active_tokens":        len(TOKENS),
+        "proxies_healthy":      f"{healthy_proxies}/{len(PROXIES)}",
     })
 
 
@@ -251,48 +313,65 @@ async def stream_music(
 
         outtmpl = os.path.join(CACHE_DIR, f"{video_id}.tmp.%(ext)s")
 
-        if type == "audio":
-            cmd = [
+        def build_cmd(proxy: str | None) -> list[str]:
+            base = [
                 "yt-dlp",
                 "--cookies", COOKIES_FILE,
                 "--js-runtimes", "deno",
                 "--remote-components", "ejs:github",
                 "--extractor-args", "youtube:player_client=tv,mweb",
-                "-f", "bestaudio[ext=m4a]/bestaudio[ext=opus]/bestaudio/best",
-                "-o", outtmpl,
-                "--quiet",
-                video_id,
             ]
-        else:
-            cmd = [
-                "yt-dlp",
-                "--cookies", COOKIES_FILE,
-                "--js-runtimes", "deno",
-                "--remote-components", "ejs:github",
-                "--extractor-args", "youtube:player_client=tv,mweb",
-                "-f", "(bestvideo[height<=?720]+bestaudio)/best",
-                "-o", outtmpl,
-                "--quiet",
-                video_id,
-            ]
+            if proxy:
+                base += ["--proxy", proxy]
+            if type == "audio":
+                base += ["-f", "bestaudio[ext=m4a]/bestaudio[ext=opus]/bestaudio/best"]
+            else:
+                base += ["-f", "(bestvideo[height<=?720]+bestaudio)/best"]
+            base += ["-o", outtmpl, "--quiet", video_id]
+            return base
 
-        try:
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            _, stderr = await process.communicate()
+        proxy_order = await get_proxy_order() if PROXIES else [None]
+        last_stderr = b""
+        succeeded   = False
 
-            if process.returncode != 0:
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"yt-dlp error: {stderr.decode()[:300]}",
+        for proxy in proxy_order:
+            cmd = build_cmd(proxy)
+            try:
+                process = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
                 )
-        except HTTPException:
-            raise
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
+                _, stderr = await process.communicate()
+
+                if process.returncode == 0:
+                    succeeded = True
+                    if proxy:
+                        _mark_proxy_success(proxy)
+                    break
+
+                last_stderr = stderr
+                # Only treat this as a proxy-specific failure (and try
+                # the next one) on signs of blocking/rate-limiting;
+                # other errors (bad URL, private video) won't be fixed
+                # by switching proxies, so stop early.
+                err_text = stderr.decode(errors="ignore")
+                if proxy and ("429" in err_text or "blocked" in err_text.lower() or "Too Many Requests" in err_text):
+                    _mark_proxy_fail(proxy)
+                    continue
+                else:
+                    break
+            except Exception as e:
+                last_stderr = str(e).encode()
+                if proxy:
+                    _mark_proxy_fail(proxy)
+                continue
+
+        if not succeeded:
+            raise HTTPException(
+                status_code=500,
+                detail=f"yt-dlp error: {last_stderr.decode(errors='ignore')[:300]}",
+            )
 
         actual_tmp = None
         for fname in os.listdir(CACHE_DIR):
@@ -322,3 +401,4 @@ if __name__ == "__main__":
     import uvicorn
     port = find_free_port(DEFAULT_PORT)
     uvicorn.run(app, host="0.0.0.0", port=port)
+    
