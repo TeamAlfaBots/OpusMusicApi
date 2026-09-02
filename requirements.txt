@@ -4,4 +4,7 @@ uvicorn
 yt-dlp
 aiofiles
 aiohttp
+python-dotenv
+libsql-client
+
 
