@@ -373,7 +373,16 @@ async def stream_music(
             if proxy:
                 base += ["--proxy", proxy]
             if type == "audio":
-                base += ["-f", "bestaudio[ext=m4a]/bestaudio[ext=opus]/bestaudio/best"]
+                # Cap audio bitrate so files stay small (Telegram-friendly,
+                # comparable to other music APIs which serve ~2-7MB songs).
+                # "bestaudio[abr<=?128]" prefers the best track at or under
+                # 128kbps; the "best/bestaudio" fallbacks handle sources
+                # that don't expose an abr tag at all.
+                base += [
+                    "-f",
+                    "bestaudio[abr<=?128][ext=m4a]/bestaudio[abr<=?128][ext=opus]"
+                    "/bestaudio[abr<=?128]/bestaudio/best",
+                ]
             else:
                 base += ["-f", "(bestvideo[height<=?720]+bestaudio)/best"]
             base += ["-o", outtmpl, "--quiet", video_id]
