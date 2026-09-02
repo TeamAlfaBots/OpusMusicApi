@@ -9,10 +9,19 @@ import time
 import uuid
 import socket
 import asyncio
+from dotenv import load_dotenv
 from fastapi import FastAPI, BackgroundTasks, Header, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 
 from OpusApi.database.stats import init_db, add_download, get_stats
+from OpusApi.database.song_cache import (
+    init_cache_db,
+    get_cached_song,
+    save_song,
+    get_cache_stats,
+)
+
+load_dotenv()
 
 app = FastAPI(title="OpusApi")
 
@@ -103,6 +112,7 @@ def find_free_port(preferred: int) -> int:
 @app.on_event("startup")
 async def startup():
     await init_db()
+    await init_cache_db()
 
 TOKENS     = {}
 START_TIME = time.time()
@@ -237,6 +247,14 @@ async def api_stats(request: Request):
     free_mb = round(_free_bytes(CACHE_DIR) / (1024 * 1024), 2)
     now = time.time()
     healthy_proxies = sum(1 for p in PROXIES if _blocked_until[p] <= now)
+
+    try:
+        turso_stats = await get_cache_stats()
+        turso_songs = turso_stats["total_songs_cached"]
+        turso_mb = round(turso_stats["total_cache_bytes"] / (1024 * 1024), 2)
+    except Exception:
+        turso_songs, turso_mb = "unavailable", "unavailable"
+
     return JSONResponse({
         "status":               "success",
         "total_song_downloads": total_dl,
@@ -244,6 +262,8 @@ async def api_stats(request: Request):
         "free_disk_mb":         free_mb,
         "active_tokens":        len(TOKENS),
         "proxies_healthy":      f"{healthy_proxies}/{len(PROXIES)}",
+        "turso_songs_cached":   turso_songs,
+        "turso_cache_size_mb":  turso_mb,
     })
 
 
@@ -290,7 +310,7 @@ async def stream_music(
         TOKENS.pop(actual_token, None)
         raise HTTPException(status_code=401, detail="Token Expired")
 
-    # Fast path: already cached, no lock needed.
+    # Fast path: already on local disk, no lock/network needed.
     cached = find_cached_file(video_id, type)
     if cached:
         touch_cached_file(cached)
@@ -304,14 +324,35 @@ async def stream_music(
     # same video don't race on the same temp file.
     lock = await get_video_lock(video_id)
     async with lock:
-        # Re-check cache: another request may have finished downloading
-        # this video while we were waiting for the lock.
+        # Re-check local disk: another request may have finished
+        # downloading this video while we were waiting for the lock.
         cached = find_cached_file(video_id, type)
         if cached:
             touch_cached_file(cached)
             await add_download({"video_id": video_id})
             return FileResponse(
                 cached,
+                media_type="audio/mp4" if type == "audio" else "video/mp4",
+            )
+
+        # Second tier: check the persistent Turso cache. This survives
+        # restarts, so a song downloaded before a redeploy is still
+        # served instantly instead of hitting yt-dlp/proxies again.
+        try:
+            turso_hit = await get_cached_song(video_id, type)
+        except Exception:
+            turso_hit = None  # Turso unreachable — fall through to download.
+
+        if turso_hit:
+            final_cache = os.path.join(CACHE_DIR, f"{video_id}.{turso_hit['ext']}")
+            try:
+                with open(final_cache, "wb") as f:
+                    f.write(turso_hit["data"])
+            except Exception:
+                pass  # Disk write failed — still serve straight from memory below.
+            await add_download({"video_id": video_id})
+            return Response(
+                content=turso_hit["data"],
                 media_type="audio/mp4" if type == "audio" else "video/mp4",
             )
 
@@ -399,6 +440,19 @@ async def stream_music(
         # was waiting on us sees the finished file, not a half-written one.
         _move_to_cache(actual_tmp, final_cache)
 
+        # Persist into Turso in the background so future requests (even
+        # after a restart) hit the cache instead of re-downloading.
+        # Failure here must never break the response to this request.
+        async def _persist_to_turso():
+            try:
+                with open(final_cache, "rb") as f:
+                    data = f.read()
+                await save_song(video_id, type, actual_ext, data)
+            except Exception:
+                pass
+
+        background_tasks.add_task(_persist_to_turso)
+
         return FileResponse(
             final_cache,
             media_type="audio/mp4" if type == "audio" else "video/mp4",
@@ -409,3 +463,4 @@ if __name__ == "__main__":
     import uvicorn
     port = find_free_port(DEFAULT_PORT)
     uvicorn.run(app, host="0.0.0.0", port=port)
+    
