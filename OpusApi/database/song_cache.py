@@ -34,9 +34,15 @@ def _get_client():
                 "TURSO_DATABASE_URL / TURSO_AUTH_TOKEN not set — "
                 "check your .env file."
             )
-        # libsql_client accepts the libsql:// scheme directly for remote DBs.
+        # Use the HTTP protocol instead of the default libsql://
+        # (Hrana/WebSocket) scheme. Some hosts (e.g. Render) reject the
+        # WebSocket upgrade handshake, causing
+        # "WSServerHandshakeError: 400, Invalid response status" on
+        # startup. https:// avoids that entirely and is just as reliable
+        # for our simple request/response query pattern.
+        url = TURSO_DATABASE_URL.replace("libsql://", "https://")
         _client = libsql_client.create_client(
-            url=TURSO_DATABASE_URL,
+            url=url,
             auth_token=TURSO_AUTH_TOKEN,
         )
     return _client
@@ -103,4 +109,3 @@ async def get_cache_stats() -> dict:
         "total_songs_cached": row[0],
         "total_cache_bytes": row[1],
     }
-
