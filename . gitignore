@@ -1,0 +1,13 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+venv/
+
+# Cache / runtime data
+OpusApi/saved/*
+!OpusApi/saved/__init__.py
+*.log
+cookies.txt
