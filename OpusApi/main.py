@@ -9,6 +9,7 @@ import time
 import uuid
 import socket
 import asyncio
+import logging
 from dotenv import load_dotenv
 from fastapi import FastAPI, BackgroundTasks, Header, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
@@ -22,6 +23,9 @@ from OpusApi.database.song_cache import (
 )
 
 load_dotenv()
+
+logger = logging.getLogger("opusapi.cache")
+logging.basicConfig(level=logging.INFO)
 
 app = FastAPI(title="OpusApi")
 
@@ -314,6 +318,7 @@ async def stream_music(
     cached = find_cached_file(video_id, type)
     if cached:
         touch_cached_file(cached)
+        logger.info(f"CACHE HIT (disk): video_id={video_id} type={type}")
         await add_download({"video_id": video_id})
         return FileResponse(
             cached,
@@ -329,6 +334,7 @@ async def stream_music(
         cached = find_cached_file(video_id, type)
         if cached:
             touch_cached_file(cached)
+            logger.info(f"CACHE HIT (disk, post-lock): video_id={video_id} type={type}")
             await add_download({"video_id": video_id})
             return FileResponse(
                 cached,
@@ -340,10 +346,15 @@ async def stream_music(
         # served instantly instead of hitting yt-dlp/proxies again.
         try:
             turso_hit = await get_cached_song(video_id, type)
-        except Exception:
+        except Exception as e:
             turso_hit = None  # Turso unreachable — fall through to download.
+            logger.warning(f"Turso lookup failed for video_id={video_id}: {e}")
 
         if turso_hit:
+            logger.info(
+                f"CACHE HIT (turso): video_id={video_id} type={type} "
+                f"size={len(turso_hit['data'])} bytes"
+            )
             final_cache = os.path.join(CACHE_DIR, f"{video_id}.{turso_hit['ext']}")
             try:
                 with open(final_cache, "wb") as f:
@@ -355,6 +366,8 @@ async def stream_music(
                 content=turso_hit["data"],
                 media_type="audio/mp4" if type == "audio" else "video/mp4",
             )
+
+        logger.info(f"CACHE MISS — downloading: video_id={video_id} type={type}")
 
         # Make room before downloading, so a nearly-full disk doesn't
         # fail the download partway through.
@@ -464,8 +477,12 @@ async def stream_music(
                 with open(final_cache, "rb") as f:
                     data = f.read()
                 await save_song(video_id, type, actual_ext, data)
-            except Exception:
-                pass
+                logger.info(
+                    f"SAVED TO TURSO: video_id={video_id} type={type} "
+                    f"size={len(data)} bytes"
+                )
+            except Exception as e:
+                logger.warning(f"Turso save failed for video_id={video_id}: {e}")
 
         background_tasks.add_task(_persist_to_turso)
 
@@ -479,4 +496,4 @@ if __name__ == "__main__":
     import uvicorn
     port = find_free_port(DEFAULT_PORT)
     uvicorn.run(app, host="0.0.0.0", port=port)
-    
+                            
