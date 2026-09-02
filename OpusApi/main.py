@@ -373,15 +373,22 @@ async def stream_music(
             if proxy:
                 base += ["--proxy", proxy]
             if type == "audio":
-                # Cap audio bitrate so files stay small (Telegram-friendly,
-                # comparable to other music APIs which serve ~2-7MB songs).
-                # "bestaudio[abr<=?128]" prefers the best track at or under
-                # 128kbps; the "best/bestaudio" fallbacks handle sources
-                # that don't expose an abr tag at all.
+                # Filtering by source abr isn't reliable — many YouTube
+                # videos only expose a single high-bitrate audio track,
+                # so "bestaudio[abr<=?128]" has nothing to match and
+                # falls through to the uncapped "best" anyway (this is
+                # why files were still coming out at 10-17MB).
+                #
+                # Instead: grab the best available audio, then force
+                # yt-dlp's ffmpeg post-processor to re-encode it down to
+                # a fixed 128kbps MP3. This guarantees small, consistent
+                # file sizes (~2-5MB for a typical song) regardless of
+                # what the source track was.
                 base += [
-                    "-f",
-                    "bestaudio[abr<=?128][ext=m4a]/bestaudio[abr<=?128][ext=opus]"
-                    "/bestaudio[abr<=?128]/bestaudio/best",
+                    "-f", "bestaudio/best",
+                    "-x",
+                    "--audio-format", "mp3",
+                    "--audio-quality", "128K",
                 ]
             else:
                 base += ["-f", "(bestvideo[height<=?720]+bestaudio)/best"]
